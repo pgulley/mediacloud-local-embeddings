@@ -1,0 +1,10 @@
+sentence-transformers 
+faiss-cpu 
+tiktoken 
+pandas 
+requests 
+python-dotenv
+transformers 
+torch
+mediacloud	
+pydantic-settings

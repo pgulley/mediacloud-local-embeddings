@@ -12,16 +12,19 @@ from collections import defaultdict
 
 from FaissDedup import FaissDedupWrapper
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-class embedding_config(BaseModel):
-	mc_api_key: str = ""
-	hf_token: str = ""
+US_NATIONAL_COLLECTION = 34412234 #just a default for now
+
+class embedding_config(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+    mc_api_key: str = ""
+    hf_token: str = ""
 
 class LocalEmbeddingContext():
     def __init__(self, mc_query=None, mc_window=30):
-    	self.config = embedding_config()
-
+        self.config = embedding_config()
+        print(self.config)
         self.encoder = tiktoken.get_encoding("cl100k_base")
         self.embedding_model = SentenceTransformer("google/embeddinggemma-300m", 
                                 token = self.config.hf_token,
@@ -36,13 +39,14 @@ class LocalEmbeddingContext():
         self.cdocs = pd.DataFrame()
         if not self.raw_stories.empty:
             self.embed_and_index()
-            self.dedup_index()
+            #self.dedup_index()
     
     def get_stories(self, query, window):
         start = datetime.datetime.now() 
         today = datetime.date.today()
         window = datetime.timedelta(window)
         mc_search = api.SearchApi(self.config.mc_api_key)
+
     
         all_stories = []
         pagination_token = None
@@ -60,10 +64,10 @@ class LocalEmbeddingContext():
 
 
     def chunk_text(self, txt, max_tokens = 900):
-    	"""
-		"Chunk" text blocks - encode them and split them into blocks that can be consumed by the embedding model
+        """
+        "Chunk" text blocks - encode them and split them into blocks that can be consumed by the embedding model
 
-    	"""
+        """
         paras = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
         chunks, current, cur_tokens = [], [], 0
         for p in paras:
@@ -85,7 +89,7 @@ class LocalEmbeddingContext():
 
     def embed_and_index(self):
         """
-		Run the fetched text through the embedding model and store it in a vector index. 
+        Run the fetched text through the embedding model and store it in a vector index. 
         """
         start = datetime.datetime.now() 
         if self.raw_stories.empty:
