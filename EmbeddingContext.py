@@ -1,14 +1,10 @@
 from mediacloud import api
 import datetime 
-import time
 import pandas as pd
-from sentence_transformers import SentenceTransformer, util
-import numpy as np
+from sentence_transformers import SentenceTransformer
 import tiktoken
-import os
 import re
-import faiss
-from collections import defaultdict
+
 
 from FaissDedup import FaissDedupWrapper
 
