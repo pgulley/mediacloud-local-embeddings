@@ -81,6 +81,13 @@ if search_btn:
         else:
             st.dataframe(rows[["score", "publish_date", "title", "text"]], use_container_width=True, height=600)
             st.session_state["last_results"] = rows
+            # Update attention chart after search builds context
+            try:
+                aot = ctx["lec"].attention_over_time()
+                if not aot.empty:
+                    st.line_chart(aot.set_index("date")[ ["original", "semantic"] ])
+            except Exception as e:
+                st.info(f"Attention-over-time unavailable: {e}")
 
 
 st.header("Summarize")

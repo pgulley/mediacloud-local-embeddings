@@ -100,6 +100,10 @@ class LocalEmbeddingContext():
         self.backend: VectorIndexBackend = index_backend or FaissInMemoryBackend()
         self.index = None  # legacy attribute mirrors backend.index if present
         self.cdocs = pd.DataFrame()
+        # Attention-over-time state
+        self._story_date_counts = {}
+        self._id_to_date = {}
+        self._kept_story_ids = set()
         
         if mc_query != None:
             self.build_index_from_query(mc_query, mc_window)
@@ -155,6 +159,12 @@ class LocalEmbeddingContext():
                 except Exception:
                     pass
 
+        # Reset attention state
+        from collections import defaultdict
+        self._story_date_counts = defaultdict(int)
+        self._id_to_date = {}
+        self._kept_story_ids = set()
+
         while more_stories:
             page, pagination_token = mc_search.story_list(
                 query,
@@ -171,6 +181,16 @@ class LocalEmbeddingContext():
                 text = story.get("text") or ""
                 title = story.get("title") or ""
                 publish_date = story.get("publish_date")
+                story_id = story.get("stories_id") or story.get("id") or None
+                # Track original attention counts by date (date-only)
+                if publish_date:
+                    try:
+                        dstr = str(publish_date)[:10]
+                        self._story_date_counts[dstr] += 1
+                        if story_id is not None:
+                            self._id_to_date[story_id] = dstr
+                    except Exception:
+                        pass
                 chunks = self.chunk_text(text)
                 for ch in chunks:
                     num_chunks += 1
@@ -178,7 +198,8 @@ class LocalEmbeddingContext():
                     buf_meta.append({
                         "title": title,
                         "text": ch,
-                        "publish_date": publish_date
+                        "publish_date": publish_date,
+                        "story_id": story_id
                     })
                     # Flush when buffer large enough
                     if len(buf_inputs) >= 128:
@@ -206,6 +227,13 @@ class LocalEmbeddingContext():
             kept_count = 0
         if kept_count > 0 and hasattr(self.backend, "_metas"):
             self.cdocs = pd.DataFrame(self.backend._metas)
+            # Track semantic attention by story id if present
+            if "story_id" in self.cdocs.columns:
+                for sid in self.cdocs["story_id" ].dropna().unique().tolist():
+                    try:
+                        self._kept_story_ids.add(sid)
+                    except Exception:
+                        pass
         else:
             self.cdocs = pd.DataFrame(columns=["title", "text", "publish_date"])
 
@@ -220,6 +248,35 @@ class LocalEmbeddingContext():
                 })
             except Exception:
                 pass
+
+    def attention_over_time(self):
+        """
+        Returns a DataFrame with columns: date, original, semantic.
+        original: count of all stories per date for the original query.
+        semantic: count of unique kept stories per date (derived from indexed chunks).
+        """
+        # Build semantic counts by mapping kept story ids to dates
+        from collections import defaultdict
+        sem_counts = defaultdict(int)
+        for sid in self._kept_story_ids:
+            dstr = self._id_to_date.get(sid)
+            if dstr:
+                sem_counts[dstr] += 1
+        # Union of dates
+        all_dates = set(self._story_date_counts.keys()) | set(sem_counts.keys())
+        if not all_dates:
+            return pd.DataFrame(columns=["date", "original", "semantic"]).astype({"date": "datetime64[ns]"})
+        rows = []
+        for d in sorted(all_dates):
+            rows.append({
+                "date": d,
+                "original": int(self._story_date_counts.get(d, 0)),
+                "semantic": int(sem_counts.get(d, 0)),
+            })
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.sort_values("date")
+        return df
 
 
     def chunk_text(self, txt, max_tokens = 900):
