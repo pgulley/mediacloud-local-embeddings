@@ -6,6 +6,7 @@ test_query = '''
 test_window = 30 #Search for stories from the last 30 days
 
 if __name__ == "__main__":
+	print(f"Building local embedding context")
 	lec = LocalEmbeddingContext(test_query, test_window)
 
 	matches = lec.search("stories about minnesota")

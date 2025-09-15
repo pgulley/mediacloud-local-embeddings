@@ -8,3 +8,5 @@ transformers
 torch
 mediacloud	
 pydantic-settings
+streamlit
+ollama

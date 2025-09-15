@@ -17,8 +17,78 @@ class embedding_config(BaseSettings):
     mc_api_key: str = ""
     hf_token: str = ""
 
+class VectorIndexBackend:
+    """
+    Pluggable backend interface for vector indexing.
+    Implementations must provide setup/add/search/count/reset.
+    """
+    def setup(self, dim: int):
+        raise NotImplementedError
+
+    def add(self, vec, meta) -> bool:
+        """Add a single vector with metadata. Return True if kept (not deduped)."""
+        raise NotImplementedError
+
+    def search(self, query_vec, k: int):
+        """Return list of dicts with metadata and a 'score' field."""
+        raise NotImplementedError
+
+    def count(self) -> int:
+        return 0
+
+    def reset(self):
+        pass
+
+
+class FaissInMemoryBackend(VectorIndexBackend):
+    """
+    Default in-memory FAISS backend with HNSW and on-the-fly dedup.
+    """
+    def __init__(self, dup_threshold: float = 0.94, m: int = 32, ef_search: int = 64, ef_construction: int = 200):
+        self._deduper = None
+        self._metas = []
+        self.index = None  # exposed for compatibility
+        self._params = dict(dup_threshold=dup_threshold, m=m, ef_search=ef_search, ef_construction=ef_construction)
+
+    def setup(self, dim: int):
+        if self._deduper is not None:
+            return
+        # Initialize deduper (which initializes FAISS HNSW index internally)
+        self._deduper = FaissDedupWrapper(dim=dim,
+                                          m=self._params["m"],
+                                          ef_search=self._params["ef_search"],
+                                          ef_construction=self._params["ef_construction"],
+                                          dup_threshold=self._params["dup_threshold"])
+        self.index = self._deduper.index
+
+    def add(self, vec, meta) -> bool:
+        kept = self._deduper.add_with_dedup(vec, row_id=len(self._metas))
+        if kept:
+            self._metas.append(meta)
+        return kept
+
+    def search(self, query_vec, k: int):
+        scores, idxs = self.index.search(query_vec[None, :], k)
+        results = []
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx < 0 or idx >= len(self._metas):
+                continue
+            meta = dict(self._metas[idx])
+            meta["score"] = float(score)
+            results.append(meta)
+        return results
+
+    def count(self) -> int:
+        return len(self._metas)
+
+    def reset(self):
+        self._deduper = None
+        self._metas = []
+        self.index = None
+
+
 class LocalEmbeddingContext():
-    def __init__(self, mc_query=None, mc_window=30):
+    def __init__(self, mc_query=None, mc_window=30, index_backend: VectorIndexBackend = None):
         self.config = embedding_config()
         print(self.config)
         self.encoder = tiktoken.get_encoding("cl100k_base")
@@ -26,16 +96,15 @@ class LocalEmbeddingContext():
                                 token = self.config.hf_token,
                                 device="mps")
         
-        # Vector index + metadata built incrementally
-        self.index = None  # kept for compatibility; will reference self.deduper.index
-        self.deduper = None  # FaissDedupWrapper, initialized on first batch when dim known
-        self._kept_rows = []  # list of metadata dicts aligned with FAISS internal ids
+        # Pluggable backend
+        self.backend: VectorIndexBackend = index_backend or FaissInMemoryBackend()
+        self.index = None  # legacy attribute mirrors backend.index if present
         self.cdocs = pd.DataFrame()
         
         if mc_query != None:
             self.build_index_from_query(mc_query, mc_window)
     
-    def build_index_from_query(self, query, window, batch_size=16):
+    def build_index_from_query(self, query, window, batch_size=16, progress_callback=None):
         """
         Stream stories page-by-page from MediaCloud, chunk, embed in small batches,
         and add with on-the-fly dedup to an incremental FAISS index.
@@ -64,19 +133,27 @@ class LocalEmbeddingContext():
                 buf_inputs,
                 batch_size = min(batch_size, 16),
                 convert_to_numpy=True,
-                normalize_embeddings=True
+                normalize_embeddings=True,
+                show_progress_bar=False
             ).astype("float32")
-            # Initialize deduper and index on first batch
-            if self.deduper is None:
-                self.deduper = FaissDedupWrapper(dim=emb.shape[1])
-                self.index = self.deduper.index  # maintain legacy attribute
+            # Initialize backend and index on first batch
+            if self.index is None:
+                self.backend.setup(dim=emb.shape[1])
+                self.index = getattr(self.backend, "index", None)
             for v, meta in zip(emb, buf_meta):
-                kept = self.deduper.add_with_dedup(v, row_id=len(self._kept_rows))
-                if kept:
-                    self._kept_rows.append(meta)
+                if self.backend.add(v, meta):
                     num_kept += 1
             buf_inputs.clear()
             buf_meta.clear()
+            if progress_callback is not None:
+                try:
+                    progress_callback({
+                        "stories": num_stories,
+                        "chunks": num_chunks,
+                        "kept": num_kept
+                    })
+                except Exception:
+                    pass
 
         while more_stories:
             page, pagination_token = mc_search.story_list(
@@ -109,17 +186,40 @@ class LocalEmbeddingContext():
 
             # Flush between pages to bound memory
             flush_buffer()
+            if progress_callback is not None:
+                try:
+                    progress_callback({
+                        "stories": num_stories,
+                        "chunks": num_chunks,
+                        "kept": num_kept
+                    })
+                except Exception:
+                    pass
 
         # Final flush
         flush_buffer()
 
-        # Materialize DataFrame of kept rows for downstream utilities
-        if self._kept_rows:
-            self.cdocs = pd.DataFrame(self._kept_rows)
+        # Materialize DataFrame of kept rows for downstream utilities (if backend supports it)
+        try:
+            kept_count = self.backend.count()
+        except Exception:
+            kept_count = 0
+        if kept_count > 0 and hasattr(self.backend, "_metas"):
+            self.cdocs = pd.DataFrame(self.backend._metas)
         else:
             self.cdocs = pd.DataFrame(columns=["title", "text", "publish_date"])
 
         print(f"Built index: stories={num_stories}, chunks={num_chunks}, kept={num_kept} in {datetime.datetime.now()-start}")
+        if progress_callback is not None:
+            try:
+                progress_callback({
+                    "stories": num_stories,
+                    "chunks": num_chunks,
+                    "kept": num_kept,
+                    "done": True
+                })
+            except Exception:
+                pass
 
 
     def chunk_text(self, txt, max_tokens = 900):
@@ -160,15 +260,7 @@ class LocalEmbeddingContext():
             
         q= f"task: search result | query: {query}"
         qv = self.embedding_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        scores, idxs = self.index.search(qv[None, :], k)
-        # Map FAISS internal ids -> kept metadata rows (aligned by insertion order)
-        results = []
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx < 0 or idx >= len(self._kept_rows):
-                continue
-            meta = dict(self._kept_rows[idx])
-            meta["score"] = float(score)
-            results.append(meta)
+        results = self.backend.search(qv.astype("float32"), k)
         rows = pd.DataFrame(results)
         if rows.empty:
             return rows
@@ -177,15 +269,14 @@ class LocalEmbeddingContext():
     def qa(self, query, k=20):
         q= f"task: question answering | query: {query}"
         qv = self.embedding_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        scores, idxs = self.index.search(qv[None, :], k)
-        results = []
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx < 0 or idx >= len(self._kept_rows):
-                continue
-            meta = dict(self._kept_rows[idx])
-            meta["score"] = float(score)
-            results.append(meta)
+        results = self.backend.search(qv.astype("float32"), k)
         rows = pd.DataFrame(results)
         if rows.empty:
             return rows
         return rows.sort_values("score", ascending=False)
+
+    def count(self) -> int:
+        try:
+            return self.backend.count()
+        except Exception:
+            return 0
