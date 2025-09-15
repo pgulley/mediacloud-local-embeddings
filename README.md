@@ -3,14 +3,13 @@ Lightweight Embeddings Demo
 
 Small experiment using EmbeddingGemma for creating a semantically searchable local index
 
-
-*** Required Settings
+## Required Settings
 - MC_API_KEY - full-text access token for mediacloud
 - HF_TOKEN - 'read' token from huggingface for downloading model
 
-** Plans
+## Plans
 
-*** Building the Semantic Index
+### Building the Semantic Index
 - Term Expansion on query before sending to MC
 - Index on disk? Currently just store the disk in memory using FAISS.
 - Rerank search results, better thresholding 
@@ -18,7 +17,6 @@ Small experiment using EmbeddingGemma for creating a semantically searchable loc
 
 - MCP-ify- turn the index into a tool that an agent could interface with
 
-*** UI/UX
-- Attention-over-time for both original query, expanded query, and semantic results
-- Demo 'summary' interface- pick an LLM to test. 
+### Demo UI/UX
+
 
