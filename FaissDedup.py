@@ -26,15 +26,15 @@ class FaissDedupWrapper:
         D, I = self.index.search(v[None, :].astype("float32"), k)
         return D, I
 
-    def add_with_dedup(self, vec: np.ndarray, row_id: int, k_probe: int = 5) -> bool:
+    def add_with_dedup(self, vec: np.ndarray, row_id: int, k_probe: int = 5) -> Tuple[bool, int | None]:
         """
-        Returns True if kept, False if treated as duplicate.
+        Returns (kept, rep_row_id). If duplicate, kept=False and rep_row_id is the kept row id.
         """
         if self.index.ntotal == 0:
             self.index.add(vec[None, :].astype("float32"))
             self.kept_ids.append(row_id)
             self.rep_to_dups.setdefault(row_id, [])
-            return True
+            return True, None
 
         D, I = self._nearest(vec, k=k_probe)
         best_sim, best_internal = float(D[0, 0]), int(I[0, 0])
@@ -42,17 +42,18 @@ class FaissDedupWrapper:
             # Map internal index -> kept row id
             rep_row_id = self.kept_ids[best_internal]
             self.rep_to_dups.setdefault(rep_row_id, []).append(row_id)
-            return False
+            return False, rep_row_id
 
         # Keep it
         self.index.add(vec[None, :].astype("float32"))
         self.kept_ids.append(row_id)
         self.rep_to_dups.setdefault(row_id, [])
-        return True
+        return True, None
 
     def add_many_with_dedup(self, vectors: np.ndarray, row_ids: Iterable[int], k_probe: int = 5) -> Tuple[List[int], Dict[int, List[int]]]:
         kept = []
         for v, rid in zip(vectors, row_ids):
-            if self.add_with_dedup(v, rid, k_probe=k_probe):
+            kept, _ = self.add_with_dedup(v, rid, k_probe=k_probe)
+            if kept:
                 kept.append(rid)
         return kept, self.rep_to_dups

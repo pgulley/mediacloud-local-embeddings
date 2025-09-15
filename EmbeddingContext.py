@@ -49,6 +49,7 @@ class FaissInMemoryBackend(VectorIndexBackend):
         self._metas = []
         self.index = None  # exposed for compatibility
         self._params = dict(dup_threshold=dup_threshold, m=m, ef_search=ef_search, ef_construction=ef_construction)
+        self._rep_to_dups = {}
 
     def setup(self, dim: int):
         if self._deduper is not None:
@@ -62,9 +63,12 @@ class FaissInMemoryBackend(VectorIndexBackend):
         self.index = self._deduper.index
 
     def add(self, vec, meta) -> bool:
-        kept = self._deduper.add_with_dedup(vec, row_id=len(self._metas))
+        kept, rep_row_id = self._deduper.add_with_dedup(vec, row_id=len(self._metas))
         if kept:
             self._metas.append(meta)
+        else:
+            # Track duplicate mapping
+            self._rep_to_dups = self._deduper.rep_to_dups
         return kept
 
     def search(self, query_vec, k: int):
@@ -85,6 +89,10 @@ class FaissInMemoryBackend(VectorIndexBackend):
         self._deduper = None
         self._metas = []
         self.index = None
+        self._rep_to_dups = {}
+
+    def get_duplicates_map(self):
+        return dict(self._rep_to_dups)
 
 
 class LocalEmbeddingContext():
@@ -192,14 +200,17 @@ class LocalEmbeddingContext():
                     except Exception:
                         pass
                 chunks = self.chunk_text(text)
-                for ch in chunks:
+                for ci, ch in enumerate(chunks):
                     num_chunks += 1
-                    buf_inputs.append(self.doc_prompt(title, ch))
+                    buf_inputs.append(self.doc_prompt(title, ch["text"]))
                     buf_meta.append({
                         "title": title,
-                        "text": ch,
+                        "text": ch["text"],
                         "publish_date": publish_date,
-                        "story_id": story_id
+                        "story_id": story_id,
+                        "chunk_index": ci,
+                        "para_start": ch.get("para_start"),
+                        "para_end": ch.get("para_end"),
                     })
                     # Flush when buffer large enough
                     if len(buf_inputs) >= 128:
@@ -285,16 +296,30 @@ class LocalEmbeddingContext():
 
         """
         paras = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
+        # Track paragraph offsets for citations
         chunks, current, cur_tokens = [], [], 0
-        for p in paras:
+        current_start_para = 0
+        for i, p in enumerate(paras):
             t = len(self.encoder.encode(p))
             if cur_tokens + t > max_tokens and current:
-                chunks.append("\n\n".join(current))
+                chunk_text = "\n\n".join(current)
+                chunks.append({
+                    "text": chunk_text,
+                    "para_start": current_start_para,
+                    "para_end": i - 1
+                })
                 current, cur_tokens = [p], t
+                current_start_para = i
             else:
                 current.append(p); cur_tokens += t
     
-        if current: chunks.append("\n\n".join(current))
+        if current:
+            chunk_text = "\n\n".join(current)
+            chunks.append({
+                "text": chunk_text,
+                "para_start": current_start_para,
+                "para_end": len(paras) - 1
+            })
 
         return chunks
 
@@ -318,6 +343,12 @@ class LocalEmbeddingContext():
         q= f"task: search result | query: {query}"
         qv = self.embedding_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         results = self.backend.search(qv.astype("float32"), k)
+        # Attach stable chunk_id for citations
+        for r in results:
+            sid = r.get("story_id")
+            cix = r.get("chunk_index")
+            if sid is not None and cix is not None:
+                r["chunk_id"] = f"{sid}:{cix}"
         rows = pd.DataFrame(results)
         if rows.empty:
             return rows
@@ -327,6 +358,11 @@ class LocalEmbeddingContext():
         q= f"task: question answering | query: {query}"
         qv = self.embedding_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         results = self.backend.search(qv.astype("float32"), k)
+        for r in results:
+            sid = r.get("story_id")
+            cix = r.get("chunk_index")
+            if sid is not None and cix is not None:
+                r["chunk_id"] = f"{sid}:{cix}"
         rows = pd.DataFrame(results)
         if rows.empty:
             return rows
@@ -337,3 +373,66 @@ class LocalEmbeddingContext():
             return self.backend.count()
         except Exception:
             return 0
+
+    # --- Citation helpers ---
+    def get_chunk_metadata(self, chunk_ids):
+        """
+        Resolve chunk_ids like "story_id:chunk_index" to metadata rows.
+        """
+        if not hasattr(self.backend, "_metas"):
+            return []
+        want = set(chunk_ids)
+        out = []
+        for m in getattr(self.backend, "_metas", []):
+            sid = m.get("story_id")
+            cix = m.get("chunk_index")
+            if sid is None or cix is None:
+                continue
+            cid = f"{sid}:{cix}"
+            if cid in want:
+                out.append(dict(m, chunk_id=cid))
+        return out
+
+    def get_snippet(self, chunk_id, max_chars=240):
+        rows = self.get_chunk_metadata([chunk_id])
+        if not rows:
+            return ""
+        text = (rows[0].get("text") or "").strip()
+        return text[:max_chars]
+
+    def build_citation_bundle(self, results_df):
+        """
+        Build a citation mapping and reference list from a search results DataFrame.
+        Returns { citations: [{id:"[1]", story_id, title, url?, publish_date, snippet}], inline_map: {chunk_id:"[1]"} }
+        """
+        if results_df is None or results_df.empty:
+            return {"citations": [], "inline_map": {}}
+        # Group by story_id to assign numeric ids
+        refs = []
+        inline_map = {}
+        story_to_num = {}
+        next_id = 1
+        for _, row in results_df.iterrows():
+            sid = row.get("story_id")
+            cix = row.get("chunk_index")
+            cid = row.get("chunk_id") or (f"{sid}:{cix}" if sid is not None and cix is not None else None)
+            if sid is None or cid is None:
+                continue
+            if sid not in story_to_num:
+                label = f"[{next_id}]"
+                story_to_num[sid] = label
+                refs.append({
+                    "id": label,
+                    "story_id": sid,
+                    "title": row.get("title"),
+                    "publish_date": row.get("publish_date"),
+                    "snippet": (row.get("text") or "").strip()[:240],
+                })
+                next_id += 1
+            inline_map[cid] = story_to_num[sid]
+        return {"citations": refs, "inline_map": inline_map}
+
+    def get_duplicates_map(self):
+        if hasattr(self.backend, "get_duplicates_map"):
+            return self.backend.get_duplicates_map()
+        return {}
