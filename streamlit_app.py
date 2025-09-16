@@ -45,7 +45,7 @@ def build_index(query: str, window: int):
     return ctx["lec"], dur
 
 
-st.title("LightEmbed: MediaCloud Embedding Demo")
+st.title("Featherweight Embeddings: MediaCloud Demo")
 
 with st.sidebar:
     st.header("Build Index")

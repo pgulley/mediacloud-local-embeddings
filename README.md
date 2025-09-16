@@ -1,5 +1,5 @@
-Lightweight Embeddings Demo
-===========================
+Featherweight Embeddings
+========================
 
 Small experiment using EmbeddingGemma for creating a semantically searchable local index
 
