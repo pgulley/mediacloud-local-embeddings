@@ -10,3 +10,6 @@ mediacloud
 pydantic-settings
 streamlit
 ollama
+scikit-learn
+umap-learn
+plotly

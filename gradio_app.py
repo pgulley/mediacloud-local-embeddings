@@ -10,11 +10,15 @@ from summarize import (
     summarize_single_pass,
     summarize_map_reduce,
 )
+from clustering import EmbeddingClusterAnalyzer, run_full_clustering_analysis
 
 # Global state
 context: Optional[LocalEmbeddingContext] = None
 last_search_results: Optional[pd.DataFrame] = None
 last_query: str = ""
+# Clustering Analysis state
+cluster_analyzer: Optional[EmbeddingClusterAnalyzer] = None
+last_clustering_summary: str = ""
 # Global settings
 global_model: str = "llama3:8b"
 global_temperature: float = 0.2
@@ -313,13 +317,62 @@ def update_settings(model: str, temperature: float) -> str:
     return f"✅ Settings updated: Model={model}, Temperature={temperature}"
 
 
-def reset_context() -> Tuple[str, str, str, str, pd.DataFrame, pd.DataFrame]:
+def run_clustering_analysis(n_clusters: Optional[int] = None, progress=gr.Progress()) -> Tuple[str, str]:
+    """Run clustering analysis with k-means and UMAP."""
+    global context, cluster_analyzer, last_clustering_summary
+    
+    if context is None or context.index is None:
+        return "❌ Please build an index first.", ""
+    
+    try:
+        progress(0.1, desc="Initializing clustering analysis...")
+        
+        # Run the full clustering analysis pipeline
+        analyzer, summary = run_full_clustering_analysis(context, n_clusters)
+        
+        progress(0.9, desc="Generating visualization...")
+        
+        # Store the analyzer globally for plot generation
+        cluster_analyzer = analyzer
+        last_clustering_summary = summary
+        
+        progress(1.0, desc="Analysis complete!")
+        
+        status = f"✅ Clustering Analysis completed! Found {analyzer.n_clusters} clusters from {len(analyzer.embeddings)} embeddings."
+        return status, summary
+        
+    except Exception as e:
+        return f"❌ Clustering Analysis error: {str(e)}", ""
+
+
+def generate_cluster_plot():
+    """Generate the UMAP cluster visualization plot."""
+    global cluster_analyzer
+    
+    if cluster_analyzer is None:
+        return None
+    
+    try:
+        # Create the scatter plot
+        fig = cluster_analyzer.create_scatter_plot(
+            color_by='cluster',
+            title="UMAP Visualization of Embedding Clusters"
+        )
+        return fig
+    except Exception as e:
+        print(f"Error generating plot: {str(e)}")
+        return None
+
+
+def reset_context() -> Tuple[str, str, str, str, pd.DataFrame, pd.DataFrame, str, str, None]:
     """Reset the application state."""
-    global context, last_search_results, last_query
+    global context, last_search_results, last_query, cluster_analyzer, last_clustering_summary
     
     context = None
     last_search_results = None
     last_query = ""
+    cluster_analyzer = None
+    last_clustering_summary = ""
     
     return (
         "🔄 Application reset. Ready to build a new index!",
@@ -328,6 +381,9 @@ def reset_context() -> Tuple[str, str, str, str, pd.DataFrame, pd.DataFrame]:
         "",  # summary_output
         pd.DataFrame(),  # search_results
         pd.DataFrame(),  # qa_results
+        "",  # analysis_status
+        "",  # analysis_summary
+        None,  # cluster_plot
     )
 
 
@@ -519,6 +575,71 @@ with gr.Blocks(title="Featherweight Embeddings: MediaCloud Semantic Search", the
             outputs=[chart_output]
         )
     
+    with gr.Tab("🔬 Clustering"):
+        gr.Markdown("## Clustering Analysis")
+        gr.Markdown("Perform k-means clustering and UMAP dimensionality reduction on your embedding data to discover patterns and visualize clusters.")
+        
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.Markdown("### Clustering Settings")
+                n_clusters_input = gr.Slider(
+                    label="Number of Clusters",
+                    minimum=2,
+                    maximum=20,
+                    value=5,
+                    step=1,
+                    info="Leave at default to auto-detect optimal number"
+                )
+                auto_clusters = gr.Checkbox(
+                    label="Auto-detect optimal clusters",
+                    value=True,
+                    info="Uses silhouette score to find best k"
+                )
+            with gr.Column(scale=1):
+                analyze_btn = gr.Button("🔬 Run Clustering Analysis", variant="primary", size="lg")
+                
+        analysis_status = gr.Textbox(label="Analysis Status", interactive=False)
+        
+        with gr.Row():
+            with gr.Column():
+                analysis_summary = gr.Textbox(
+                    label="Cluster Analysis Summary", 
+                    interactive=False, 
+                    lines=15,
+                    info="Detailed breakdown of discovered clusters"
+                )
+            with gr.Column():
+                cluster_plot = gr.Plot(
+                    label="UMAP Cluster Visualization",
+                    show_label=True
+                )
+        
+        # Update n_clusters based on auto_clusters checkbox
+        def update_clusters_slider(auto_detect):
+            if auto_detect:
+                return gr.update(interactive=False, info="Will auto-detect optimal number")
+            else:
+                return gr.update(interactive=True, info="Manual cluster count")
+        
+        auto_clusters.change(
+            update_clusters_slider,
+            inputs=[auto_clusters],
+            outputs=[n_clusters_input]
+        )
+        
+        # Main analysis function that handles auto-detection
+        def run_analysis_with_auto(n_clusters_manual, auto_detect, progress=gr.Progress()):
+            n_clusters = None if auto_detect else n_clusters_manual
+            status, summary = run_clustering_analysis(n_clusters, progress)
+            plot = generate_cluster_plot()
+            return status, summary, plot
+        
+        analyze_btn.click(
+            run_analysis_with_auto,
+            inputs=[n_clusters_input, auto_clusters],
+            outputs=[analysis_status, analysis_summary, cluster_plot]
+        )
+    
     with gr.Tab("⚙️ Settings"):
         gr.Markdown("## LLM Settings")
         
@@ -543,7 +664,7 @@ with gr.Blocks(title="Featherweight Embeddings: MediaCloud Semantic Search", the
         
         reset_btn.click(
             reset_context,
-            outputs=[reset_output, index_info, search_output, summary_output, search_results, qa_results]
+            outputs=[reset_output, index_info, search_output, summary_output, search_results, qa_results, analysis_status, analysis_summary, cluster_plot]
         )
 
 if __name__ == "__main__":
